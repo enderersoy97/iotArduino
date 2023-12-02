@@ -1,0 +1,585 @@
+// 911 Send data
+// 912 moisture sensor data
+// 913 feedback
+// 914 weather
+// 915 hour
+//
+
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include <Arduino.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <SoftwareSerial.h>
+#include <EEPROM.h>
+
+// bluetooth ve eeprom
+SoftwareSerial mySerial(1, 0); // RX pin 1, TX pin 0
+const int maxLength = 64;
+char receivedData[maxLength];
+int dataIndex = 0;
+
+String x;
+String abc1;
+String abc2;
+
+
+// WiFi bağlantı ayarları
+const char* ssid;
+const char* password;
+const char* mqttServer = "broker.hivemq.com";
+const int mqttPort = 1883;
+const char* mqttUser = "";
+const char* mqttPassword = "";
+
+const String endpoint = "http://api.openweathermap.org/data/2.5/weather?q=Famagusta,cy&APPID=";
+
+const String key = "2066910cbda95b26ea85e68920c3304a";
+
+
+#define SOIL_MOISTURE_PIN 26
+#define RELAY_PIN 15
+
+const int MAX_MESSAGES = 30;
+
+char messages[MAX_MESSAGES][100];
+int messageCount = 0;
+
+char* messageTimer;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org");
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+unsigned long previousMillis = 0;
+const long interval = 10000;  // 15 saniye
+
+const int JSON_BUFFER_SIZE = 2048; // JSON önbellek boyutunu büyüttük
+StaticJsonBuffer<JSON_BUFFER_SIZE> jsonBuffer;
+
+unsigned long previousMillisWeather = 0; // Önceki anı saklamak için
+const long intervalWeather = 10000; // 30 saniyelik güncelleme aralığı
+
+unsigned long startTime = 0;
+unsigned long stopTime =30000;
+const unsigned long irrigationDuration = 30000;
+bool specialcontroller = false;
+bool specialcontroller2 = false;
+bool timmecontroller = false;
+
+unsigned long baslangic = 0;
+const unsigned long bitis = 10000;
+
+unsigned long lastMessageTimeBT = 0; // Son mesajın gönderildiği zaman
+unsigned long messageIntervalBT = 5000; // Mesaj gönderme aralığı (milisaniye cinsinden)
+
+void setup() {
+  Serial.begin(9600);
+  delay(5000);
+  mySerial.begin(115200);    // Bluetooth
+  EEPROM.begin(512);
+  abc1 = readFromEEPROM(0);
+  abc2 = readFromEEPROM(50);
+  bluetoothSet();
+  Serial.println("wifi: " + abc1);
+  Serial.println("wifi password: " + abc2);
+  ssid = abc1.c_str();
+  password = abc2.c_str();
+  Serial.println(ssid);
+  Serial.println(password);
+ 
+  setupWiFi();
+  // Röle pini çıkış olarak ayarla
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // Röleyi başlangıçta kapalı konumda tut
+
+  // MQTT broker'a bağlan
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
+
+  timeClient.begin();
+  timeClient.setTimeOffset(3 * 3600);
+
+
+  
+}
+
+void loop() {
+   while (!client.connected()) {
+     if (client.connect("ESP8266Client", mqttUser, mqttPassword)) {
+       Serial.println("Connected to MQTT broker");
+    } else {
+      Serial.print("MQTT connection failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" Retrying in 5 seconds...");
+      setupWiFi();
+    }
+  }
+ 
+ if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  sendfonc();  
+  specialloop();
+unsigned long currentMillisWeather = millis();
+  
+  if (currentMillisWeather - previousMillisWeather >= intervalWeather) {
+    previousMillisWeather = currentMillisWeather;
+    weather();
+  }  
+timer();
+}
+
+void bluetoothSend() {
+  Serial.println("Sending: testtopic/155911,testtopic/155912,testtopic/155913,testtopic/155914,testtopic/155915");
+  mySerial.println("pico1,testtopic/155911,testtopic/155912,testtopic/155913,testtopic/155914,testtopic/155915");
+  Serial.println("wifi: " + abc1);
+  Serial.println("wifi password: " + abc2);
+  ssid = abc1.c_str();
+  password = abc2.c_str();
+  WiFi.begin(ssid, password);
+  Serial.println("connection tried");
+  if(WiFi.status() == WL_CONNECTED)
+    {
+      Serial.println("connection confirmed");
+    }
+}
+
+void processReceivedData() {
+  Serial.print("Received: ");
+  Serial.println(receivedData);
+
+  if (strstr(receivedData, "wifidata=") != NULL) {
+  x = receivedData + 9; // "data=" ifadesini atla ve geri kalanını x'e ata
+
+  int commaIndex = x.indexOf(",");
+  if (commaIndex != -1) {
+    abc1 = x.substring(0, commaIndex);
+    abc2 = x.substring(commaIndex + 1);
+    }
+  }
+
+  writeToEEPROM(0, abc1);
+  writeToEEPROM(50, abc2);
+  bluetoothSend();
+}
+void writeToEEPROM(int startAddress, String data) {
+  for (int i = 0; i < data.length(); i++) {
+    EEPROM.write(startAddress + i, data[i]);
+  }
+  EEPROM.write(startAddress + data.length(), '\0'); // Null karakterle bitir
+  EEPROM.commit(); // Değişiklikleri kaydet
+}
+
+String readFromEEPROM(int startAddress) {
+  String readData = "";
+  char character = EEPROM.read(startAddress);
+  int i = 0;
+  while (character != '\0' && i < maxLength) {
+    readData += character;
+    i++;
+    character = EEPROM.read(startAddress + i);
+  }
+  return readData;
+}
+
+void bluetoothSet(){
+  Serial.print("AT");
+  Serial1.print("AT");
+  delay(2000);
+  while (Serial1.available()) {
+    Serial.write(Serial1.read());
+  }
+
+  Serial.print("AT+NAMESmartFarmBT1");  //cihaz ismi
+  Serial1.print("AT+NAMESmartFarmBT1");
+  delay(2000);
+  while (Serial1.available()) {
+    Serial.write(Serial1.read());
+  }
+
+  Serial.println("AT+PIN1234");//cihaz şifre
+  Serial1.print("AT+PIN1234");
+  delay(2000);
+  while (Serial1.available()) {
+    Serial.write(Serial1.read());
+  }
+
+  Serial.print("AT+BAUD8");
+  Serial1.print("AT+BAUD8");
+  delay(2000);
+  while (Serial1.available()) {
+    Serial.write(Serial1.read());
+  }
+}
+
+void weather() {
+  if ((WiFi.status() == WL_CONNECTED)) {
+    HTTPClient http;
+    http.begin(endpoint + key);
+    int httpCode = http.GET();
+ 
+    if (httpCode > 0) {
+      String payload = http.getString();
+      
+      jsonBuffer.clear(); // JSON önbelleğini temizle
+      
+      JsonObject& jsonDocument = jsonBuffer.parseObject(payload);
+      
+      if (!jsonDocument.success()) {
+        Serial.print("parseObject() failed");
+      } else {
+        const char* description = jsonDocument["weather"][0]["description"];
+        float temp = jsonDocument["main"]["temp"].as<float>() - 273.15;
+        float temp_min = jsonDocument["main"]["temp_min"].as<float>() - 273.15;
+        float temp_max = jsonDocument["main"]["temp_max"].as<float>() - 273.15;
+        int pressure = jsonDocument["main"]["pressure"];
+        int humidity = jsonDocument["main"]["humidity"];
+        float wind_speed = jsonDocument["wind"]["speed"];
+         const char* city = jsonDocument["name"]; // Şehir adını al
+
+        Serial.println("City: " + String(city));
+        Serial.println("Description: " + String(description));
+        Serial.println("Temperature: " + String(temp) + " °C");
+        Serial.println("Min Temperature: " + String(temp_min) + " °C");
+        Serial.println("Max Temperature: " + String(temp_max) + " °C");
+        Serial.println("Pressure: " + String(pressure) + " hPa");
+        Serial.println("Humidity: " + String(humidity) + " %");
+        Serial.println("Wind Speed: " + String(wind_speed) + " m/s");
+
+         // MQTT mesajını yayınla
+         String weatherMessage = "Weather Info for " + String(city) + ":\n\n";
+weatherMessage += "Description: " + String(description) + "\n";
+weatherMessage += "Temperature: " + String(temp) + " °C\n";
+weatherMessage += "Min Temperature: " + String(temp_min) + " °C\n";
+weatherMessage += "Max Temperature: " + String(temp_max) + " °C\n";
+weatherMessage += "Pressure: " + String(pressure) + " hPa\n";
+weatherMessage += "Humidity: " + String(humidity) + " %\n";
+weatherMessage += "Wind Speed: " + String(wind_speed) + " m/s \n";
+
+client.publish("testtopic/155914", weatherMessage.c_str()); // MQTT'ye mesajı yayınla
+      }
+    } else {
+      Serial.println("Error on HTTP request");
+    }
+ 
+    http.end();
+  }
+}
+
+
+float getSoilMoisture() {
+  int sensorValue = analogRead(SOIL_MOISTURE_PIN);         // Toprağın nemini sensörden oku ve değeri döndür
+  float soilMoisture = map(sensorValue, 300, 1100, 100, 0); // 0-4095 aralığındaki değeri 0-100 aralığına dönüştür
+  return soilMoisture;
+}
+
+// MQTT callback fonksiyonu
+
+
+void sendfonc(){
+    unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    float soilMoisture = getSoilMoisture();
+    String message = "-->   Moisture level: " + String(soilMoisture) + "%";
+
+    if (!client.connected()) {
+
+      // MQTT bağlantı durumu seri portta yazdırılır
+      Serial.print("MQTT connection state: ");
+      Serial.println(client.state());
+
+      // MQTT broker'a bağlan
+      client.setServer(mqttServer, mqttPort);
+      while (!client.connected()) {
+        if (client.connect("ESP8266Client", mqttUser, mqttPassword)) {
+          Serial.println("Connected to MQTT broker");
+        } else {  
+          Serial.print("MQTT connection failed, rc=");
+          Serial.println(client.state());
+          Serial.println(" Retrying in a moment...");
+          delay(1000);
+        }
+      }
+    }
+    client.publish("testtopic/155912", message.c_str());
+    Serial.println(message);
+    previousMillis = currentMillis;  // Zaman damgasını güncelle
+  }
+}
+
+void setupWiFi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  // Bluetooth setup
+  // Assuming you have initialized mySerial for Bluetooth
+  
+  unsigned long startTime = millis(); // Get the current time
+while (WiFi.status() != WL_CONNECTED) {
+  while (millis() - startTime < 30000) { // Listen for 1 minute
+  
+    if (mySerial.available()) {
+      Serial.println(".");
+      char character = mySerial.read();
+      
+      if (character == '\n') {
+        receivedData[dataIndex] = '\0';
+        processReceivedData();
+        dataIndex = 0;
+      } else if (dataIndex < maxLength - 1) {
+        receivedData[dataIndex] = character;
+        dataIndex++;
+      }
+    }
+    if(WiFi.status() == WL_CONNECTED)
+    {
+      return;
+    }
+  }
+  
+  // WiFi setup
+  WiFi.begin(ssid, password);
+  Serial.print("wifi connection tried");
+  
+}
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("<--   Message received: ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+
+  char nullChar = '\0';
+  payload[length] = nullChar;
+  String messagee = String((char*)payload);
+
+  char messageCopy[length + 1];
+  strncpy(messageCopy, (char*)payload, length);
+  messageCopy[length] = '\0';
+
+  int currentDay = timeClient.getDay(); // Geçerli günü alın
+  processMqttMessage(messageCopy, currentDay);
+
+  if (messagee.equals("OPEN")) {
+    if (!specialcontroller) {
+      timmecontroller = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("---   Relay is OPEN");
+      client.publish("testtopic/155913", "Irrigation Started !");
+    } else {
+      client.publish("testtopic/155913", "Automatic irrigation is currently active! \n Please press the automatic irrigation button again to deactivate it !");
+    }
+  } else if (messagee.equals("CLOSE")) {
+    if (!specialcontroller) {
+      timmecontroller = false;
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("---   Relay is CLOSED");
+      client.publish("testtopic/155913", "Irrigation Stopped !");
+    } else {
+      client.publish("testtopic/155913", "Automatic irrigation is currently active! \n Please press the automatic irrigation button again to deactivate it !");
+    }
+  } else if (messagee.equals("SPECIAL")) {
+    specialcontroller = true;
+
+    if (!specialcontroller2) {
+      specialcontroller2 = true;
+      timmecontroller = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("---   Relay is OPEN");
+      client.publish("testtopic/155913", "Automatic irrigation is currently active ! \n To deactivate it, please press the automatic irrigation again !");
+      startTime = millis();
+    } else {
+      timmecontroller = false;
+      specialcontroller2 = false;
+    }
+  }
+}
+void specialloop(){
+ 
+  if (digitalRead(RELAY_PIN) == HIGH && millis() - startTime >= irrigationDuration){
+      
+      if (specialcontroller == true && specialcontroller2 == true){
+        client.publish("testtopic/155913", "Automatic irrigation finished !");
+        digitalWrite(RELAY_PIN, LOW); // Röleyi kapat
+        Serial.println("---   Relay is CLOSED");
+        specialcontroller = false;
+        specialcontroller2 = false;
+        timmecontroller = false;
+        }
+      }
+if (specialcontroller == true && specialcontroller2 == false){
+        client.publish("testtopic/155913", "Automatic irrigation is currently deactivated !"); 
+        digitalWrite(RELAY_PIN, LOW); // Röleyi kapat
+        Serial.println("---   Relay is CLOSED");
+        timmecontroller = false;
+        specialcontroller = false;
+        specialcontroller2 = false;
+        stopTime = millis();
+
+    } 
+  }
+ //-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT Broker...");
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      Serial.println("            -WELCOME TO SMART FARM-");
+      Serial.println("-->   :This means sending data from Picow");
+      Serial.println("<--   :This means getting data from Picow");
+      Serial.println("---   :This means information about relay");
+      Serial.println();
+      Serial.println("*          *          *          *          *          *");
+      Serial.println();
+      client.subscribe("testtopic/155911"); // Dinlemek istediğiniz MQTT konusu
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+ void timer() {
+  timeClient.update();
+
+  // Gerçek zamanlı saati alın
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+  int currentDay = timeClient.getDay(); // 0 for Sunday, 1 for Monday, ...
+
+  // Day names array to map day index to day names
+  const char* dayNames[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+  // İşlem yapmak için zaman aralığı kontrolü
+  unsigned long suankiMillis = millis();
+  if (suankiMillis - baslangic >= bitis) {
+    baslangic = suankiMillis; // Zaman damgasını güncelle
+
+    // Gerçek zamanlı saati ve günü seri porta yazdırın
+    Serial.print("Current time: ");
+    Serial.print(dayNames[currentDay]);
+    Serial.print(", ");
+    Serial.print(timeClient.getFormattedTime());
+    client.publish("testtopic/155915", (String(dayNames[currentDay]) + ", " + timeClient.getFormattedTime()).c_str());
+    Serial.println();
+    checkAllMessages();
+    // Burada yapmak istediğiniz gerçek zamanlı işlemleri yapabilirsiniz.
+    // Örneğin, sensörlerden veri okuma veya röle kontrolü gibi işlemler yapabilirsiniz.
+   
+  }
+}
+
+
+
+int dayOfWeekToInt(const char* dayName) {
+  const char* dayNames[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  for (int i = 0; i < 7; i++) {
+    if (strcmp(dayName, dayNames[i]) == 0) {
+      return i;
+    }
+  }
+  return -1; // Eğer geçersiz bir gün ismi verilirse -1 döndür
+}
+
+void processMqttMessage(const char* mesajZaman, int currentDay) {
+  
+  if (strcmp(mesajZaman, "clean") == 0) {
+    if (messageTimer != NULL) {
+      free(messageTimer);
+      messageTimer = NULL;
+    }
+    Serial.println("All messages cleared.");
+    return;
+  }
+
+  else if (strcmp(mesajZaman, "OPEN") == 0 || strcmp(mesajZaman, "CLOSE") == 0) {
+    Serial.println("tester: "); 
+    return;
+  }
+  
+  else {
+    // Bellek yönetimi: Önceki belleği serbest bırakın
+    if (messageTimer != NULL) {
+      free(messageTimer);
+    }
+    // Bellek tahsisi: Yeni bellek ayırın ve içeriği kopyalayın
+    messageTimer = (char*)malloc(strlen(mesajZaman) + 1);
+    if (messageTimer != NULL) {
+      strcpy(messageTimer, mesajZaman);
+    }
+  }
+}
+
+void checkAllMessages() {
+  Serial.println(messageTimer);
+    if (timmecontroller == false && messageTimer != NULL) {
+        char messageCopy[strlen(messageTimer) + 1];
+        strcpy(messageCopy, messageTimer);
+
+        // Elemanları saklamak için bir dizi oluşturalım
+        char tokensArray[100][50]; // 100 kelime, her kelime en fazla 49 karakter
+
+        int tokenCount = 0;
+        char* token = strtok(messageCopy, " ");
+        while (token != NULL) {
+            strcpy(tokensArray[tokenCount], token);
+            tokenCount++;
+
+            if (tokenCount >= 100) {
+                printf("Dizi kapasitesi dolu\n");
+                break;
+            }
+
+            token = strtok(NULL, " ");
+        }
+
+        // Her eleman için işlemleri gerçekleştir
+        for (int i = 0; i < tokenCount; i++) {
+            int currentHour = timeClient.getHours();
+            int currentMinute = timeClient.getMinutes();
+            int currentWeekday = timeClient.getDay();
+
+            char* gun1 = strtok(tokensArray[i], ":");
+            char* saat1 = strtok(NULL, ":");
+            char* dakika1 = strtok(NULL, ":");
+            char* gun2 = strtok(NULL, ":");
+            char* saat2 = strtok(NULL, ":");
+            char* dakika2 = strtok(NULL, ":");
+
+            int dayNumber1 = dayOfWeekToInt(gun1);
+            int dayNumber2 = dayOfWeekToInt(gun2);
+
+            // Saat aralıklarını kontrol edin ve röleyi kontrol edin
+            if ((currentWeekday == dayNumber1 && currentHour >= atoi(saat1) && currentMinute >= atoi(dakika1)) &&
+                (currentWeekday == dayNumber2 && currentHour <= atoi(saat2) && currentMinute < atoi(dakika2))) {
+                digitalWrite(RELAY_PIN, HIGH); // Röleyi aç
+                Serial.println("---   Relay is OPEN");
+                client.publish("testtopic/155913", "Irrigation Started by Timer !");
+                return; // Eğer bir mesajın saat aralığı uyuyorsa diğerlerini kontrol etmeye gerek yok, çık ve bitir.
+            }
+        }
+
+        // Eğer hiçbir mesajın saat aralığı uymuyorsa röleyi kapat
+        digitalWrite(RELAY_PIN, LOW);
+    }
+}
